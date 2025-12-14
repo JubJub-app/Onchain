@@ -1,0 +1,17 @@
+# dependencies
+node_modules/
+
+# env files
+.env
+
+# hardhat
+cache/
+artifacts/
+
+# logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# OS
+.DS_Store
