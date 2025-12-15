@@ -6,3 +6,8 @@ node_modules/
 
 #Secrtes
 .env
+
+# Hardhat build output
+artifacts/
+cache/
+ignition/
