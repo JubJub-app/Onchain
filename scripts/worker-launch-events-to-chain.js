@@ -23,9 +23,70 @@ function b32(str) {
   return ethers.keccak256(ethers.toUtf8Bytes(String(str)));
 }
 
+// Solidity enum Role { Viewer=0, Editor=1, Publisher=2, Admin=3 }
+// "owner" has no Solidity equivalent — mapped to Admin (3) as highest on-chain privilege.
 function roleToUint8(role) {
-  const map = { owner: 0, admin: 1, editor: 2, publisher: 3, viewer: 4 };
-  return map[String(role || "").toLowerCase()] ?? 255;
+  const map = { viewer: 0, editor: 1, publisher: 2, admin: 3, owner: 3 };
+  return map[String(role || "").toLowerCase()] ?? 0;
+}
+
+// Privilege rank for deduplication (lower number = higher privilege)
+const ROLE_PRIVILEGE = { owner: 0, admin: 1, publisher: 2, editor: 3, viewer: 4 };
+function rolePriority(role) {
+  return ROLE_PRIVILEGE[String(role || "").toLowerCase()] ?? 99;
+}
+
+// Resolve the real owner profileId from event data.
+// Priority: ev.profileId > ev.metadata.profileId > ev.owner_profile_id > ev.creator_profile_id
+// Falls back to previously-enriched staged doc value only if it is not a placeholder.
+function resolveOwnerProfileId(ev, prev) {
+  return (
+    ev.profileId ||
+    (ev.metadata && ev.metadata.profileId) ||
+    ev.owner_profile_id ||
+    ev.creator_profile_id ||
+    (prev.owner_profile_id && prev.owner_profile_id !== "unknown_for_now"
+      ? prev.owner_profile_id
+      : null)
+  );
+}
+
+// Build contributors array from the best available source.
+// Returns array of { profileId, role } with no placeholders.
+function buildContributors(prev, ev, ownerProfileId) {
+  // Priority 1: staged doc already has real contributors
+  if (Array.isArray(prev.contributors_jubjub) && prev.contributors_jubjub.length > 0) {
+    const allReal = prev.contributors_jubjub.every(
+      (c) => c.profileId && c.profileId !== "unknown_for_now"
+    );
+    if (allReal) return prev.contributors_jubjub;
+  }
+
+  // Priority 2: event doc has contributors/collaborators array
+  const candidates =
+    ev.contributors || ev.collaborators || (ev.metadata && ev.metadata.contributors);
+  if (Array.isArray(candidates) && candidates.length > 0) {
+    const filtered = candidates.filter(
+      (c) => c.profileId && c.profileId !== "unknown_for_now"
+    );
+    if (filtered.length > 0) return filtered;
+  }
+
+  // Priority 3: fallback to owner as sole contributor
+  return [{ profileId: ownerProfileId, role: "owner" }];
+}
+
+// Deduplicate by profileId, keeping the highest-privilege role per contributor.
+function deduplicateContributors(contributors) {
+  const map = new Map();
+  for (const c of contributors) {
+    if (!c.profileId) continue;
+    const existing = map.get(c.profileId);
+    if (!existing || rolePriority(c.role) < rolePriority(existing.role)) {
+      map.set(c.profileId, c);
+    }
+  }
+  return Array.from(map.values());
 }
 
 // Your Firestore stores: "YYYY-MM-DDTHH:mm:ss" (no timezone)
@@ -109,10 +170,8 @@ async function main() {
   console.log("⏱️ cursor utc:", lastUtcIso, "cursor id:", lastEventId);
 
   // Paging cursor (for Firestore query ordering)
-  // We can use the raw event_date string + doc id, because we orderBy both.
   let pageAfterRaw = null;
   let pageAfterId = null;
-
 
   const PAGE_SIZE = 250;
   const MAX_TO_PROCESS = 10;
@@ -203,10 +262,45 @@ async function main() {
 
     const prev = stageSnap.exists ? stageSnap.data() : {};
     const attempts = Number(prev.attempts || 0);
+
+    // Dead-letter: permanently mark events that have exhausted retries
     if (attempts >= 5) {
-      console.log("🛑 attempts cap reached, skipping:", eventId);
+      console.log("🛑 dead-letter: max attempts reached:", eventId);
+      await stageRef.set(
+        {
+          status: "dead_letter",
+          dead_letter_reason: "max_attempts_exceeded",
+          dead_letter_at: FieldValue.serverTimestamp(),
+          updated_at: FieldValue.serverTimestamp(),
+        },
+        { merge: true }
+      );
       continue;
     }
+
+    // Resolve real owner profileId — refuse to write on-chain with a placeholder
+    const ownerProfileId = resolveOwnerProfileId(ev, prev);
+    if (!ownerProfileId) {
+      console.log("❌ no profileId found for event, marking failed:", eventId);
+      await stageRef.set(
+        {
+          source_event_id: eventId,
+          source_collection: "events",
+          source_event_type: "launch",
+          status: "failed",
+          last_error: "missing_profile_id",
+          attempts: attempts + 1,
+          updated_at: FieldValue.serverTimestamp(),
+          created_at: prev.created_at || FieldValue.serverTimestamp(),
+        },
+        { merge: true }
+      );
+      continue;
+    }
+
+    // Build and deduplicate contributor list — no placeholders allowed
+    const rawContributors = buildContributors(prev, ev, ownerProfileId);
+    const contributors = deduplicateContributors(rawContributors);
 
     await stageRef.set(
       {
@@ -224,40 +318,22 @@ async function main() {
         last_error: null,
         updated_at: FieldValue.serverTimestamp(),
         created_at: prev.created_at || FieldValue.serverTimestamp(),
-        owner_profile_id: prev.owner_profile_id || "unknown_for_now",
-        contributors_jubjub: prev.contributors_jubjub || [
-          { profileId: "unknown_for_now", role: "owner" },
-        ],
+        owner_profile_id: ownerProfileId,
+        contributors_jubjub: contributors,
       },
       { merge: true }
     );
 
-    const staged = (await stageRef.get()).data();
-    const contributors = staged.contributors_jubjub || [];
-    if (contributors.length === 0) {
-      console.log("⚠️ contributors empty, marking error:", eventId);
-      await stageRef.set(
-        {
-          status: "error",
-          attempts: attempts + 1,
-          last_error: "contributors_jubjub empty",
-          updated_at: FieldValue.serverTimestamp(),
-        },
-        { merge: true }
-      );
-      continue;
-    }
+    const projectIdB32 = b32(projectId);
+    const platformB32 = b32(platform);
+    const sourceEventIdB32 = b32(eventId);
+    const ownerProfileB32 = b32(ownerProfileId);
 
-    const projectIdB32 = b32(staged.project_id);
-    const platformB32 = b32(staged.platform);
-    const sourceEventIdB32 = b32(staged.source_event_id);
-    const ownerProfileB32 = b32(staged.owner_profile_id || "unknown_for_now");
-
-    const contributorsB32 = contributors.map((c) => b32(c.profileId || "unknown_for_now"));
+    const contributorsB32 = contributors.map((c) => b32(c.profileId));
     const rolesU8 = contributors.map((c) => roleToUint8(c.role));
 
     try {
-      console.log("⛓️ submitting onchain:", { eventId, platform, projectId });
+      console.log("⛓️ submitting onchain:", { eventId, platform, projectId, ownerProfileId });
 
       const tx = await ledger.recordPublish(
         projectIdB32,
@@ -317,7 +393,6 @@ async function main() {
   const workerCursorChanged =
     newestConfirmedUtcIso !== lastUtcIso || String(newestConfirmedId) !== String(lastEventId);
 
-  // Persist paging cursor too (so next run scans less even if no new events)
   await stateRef.set(
     {
       last_event_date_utc: newestConfirmedUtcIso,
