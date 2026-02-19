@@ -10,5 +10,5 @@ RUN npm ci
 COPY . .
 
 # Default command (Cloud Run Job will execute this)
-CMD ["npx","hardhat","run","--no-compile","scripts/worker-launch-events-to-chain.js","--network","baseSepolia"]
+CMD ["npx","hardhat","run","scripts/worker-launch-events-to-chain.js","--network","baseSepolia"]
 
