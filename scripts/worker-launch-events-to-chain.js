@@ -1,10 +1,8 @@
 // scripts/worker-launch-events-to-chain.js
-// NOTE: This version uses paging with:
-// orderBy(event_date ASC), orderBy(__name__ ASC)
-// and startAfter(lastEventDateRaw, lastDocId)
+// v2: reads from launches_v2, calls recordLaunch with all successful platforms + contributors.
 //
-// You will need a composite index for:
-// events: event_type ASC, event_date ASC, __name__ ASC
+// Composite index required:
+// launches_v2: created_at ASC, __name__ ASC
 
 require("dotenv").config();
 const admin = require("firebase-admin");
@@ -23,132 +21,10 @@ function b32(str) {
   return ethers.keccak256(ethers.toUtf8Bytes(String(str)));
 }
 
-// Solidity enum Role { Viewer=0, Editor=1, Publisher=2, Admin=3 }
-// "owner" has no Solidity equivalent — mapped to Admin (3) as highest on-chain privilege.
-function roleToUint8(role) {
-  const map = { viewer: 0, editor: 1, publisher: 2, admin: 3, owner: 3 };
-  return map[String(role || "").toLowerCase()] ?? 0;
-}
-
-// Privilege rank for deduplication (lower number = higher privilege)
-const ROLE_PRIVILEGE = { owner: 0, admin: 1, publisher: 2, editor: 3, viewer: 4 };
-function rolePriority(role) {
-  return ROLE_PRIVILEGE[String(role || "").toLowerCase()] ?? 99;
-}
-
-// Resolve the real owner profileId from event data.
-// Priority: ev.profileId > ev.metadata.profileId > ev.owner_profile_id > ev.creator_profile_id
-// Falls back to previously-enriched staged doc value only if it is not a placeholder.
-function resolveOwnerProfileId(ev, prev) {
-  return (
-    ev.profileId ||
-    (ev.metadata && ev.metadata.profileId) ||
-    ev.owner_profile_id ||
-    ev.creator_profile_id ||
-    (prev.owner_profile_id && prev.owner_profile_id !== "unknown_for_now"
-      ? prev.owner_profile_id
-      : null)
-  );
-}
-
-// Build contributors array from the best available source.
-// Returns array of { profileId, role } with no placeholders.
-function buildContributors(prev, ev, ownerProfileId) {
-  // Priority 1: staged doc already has real contributors
-  if (Array.isArray(prev.contributors_jubjub) && prev.contributors_jubjub.length > 0) {
-    const allReal = prev.contributors_jubjub.every(
-      (c) => c.profileId && c.profileId !== "unknown_for_now"
-    );
-    if (allReal) return prev.contributors_jubjub;
-  }
-
-  // Priority 2: event doc has contributors/collaborators array
-  const candidates =
-    ev.contributors || ev.collaborators || (ev.metadata && ev.metadata.contributors);
-  if (Array.isArray(candidates) && candidates.length > 0) {
-    const filtered = candidates.filter(
-      (c) => c.profileId && c.profileId !== "unknown_for_now"
-    );
-    if (filtered.length > 0) return filtered;
-  }
-
-  // Priority 3: fallback to owner as sole contributor
-  return [{ profileId: ownerProfileId, role: "owner" }];
-}
-
-// Deduplicate by profileId, keeping the highest-privilege role per contributor.
-function deduplicateContributors(contributors) {
-  const map = new Map();
-  for (const c of contributors) {
-    if (!c.profileId) continue;
-    const existing = map.get(c.profileId);
-    if (!existing || rolePriority(c.role) < rolePriority(existing.role)) {
-      map.set(c.profileId, c);
-    }
-  }
-  return Array.from(map.values());
-}
-
-// Your Firestore stores: "YYYY-MM-DDTHH:mm:ss" (no timezone)
-// We interpret it as Australia/Melbourne local time and convert to UTC ISO Z.
-// This is ONLY for worker cursor comparisons.
-function melbourneLocalToUtcIsoZ(localStr) {
-  if (!localStr || typeof localStr !== "string") return null;
-
-  // If it already has timezone (Z or +HH:MM), parse normally
-  if (/[zZ]$/.test(localStr) || /[+-]\d\d:\d\d$/.test(localStr)) {
-    const d = new Date(localStr);
-    if (!Number.isNaN(d.getTime())) return d.toISOString();
-    return null;
-  }
-
-  const m = localStr.match(
-    /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(\.\d+)?$/
-  );
-  if (!m) return null;
-
-  const [_, y, mo, da, hh, mm, ss] = m;
-  const approxUtc = new Date(Date.UTC(+y, +mo - 1, +da, +hh, +mm, +ss));
-
-  const fmt = new Intl.DateTimeFormat("en-AU", {
-    timeZone: "Australia/Melbourne",
-    hour12: false,
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-  });
-
-  const parts = fmt.formatToParts(approxUtc).reduce((acc, p) => {
-    acc[p.type] = p.value;
-    return acc;
-  }, {});
-
-  const melbAsUtc = new Date(
-    Date.UTC(
-      +parts.year,
-      +parts.month - 1,
-      +parts.day,
-      +parts.hour,
-      +parts.minute,
-      +parts.second
-    )
-  );
-
-  const inputAsUtc = new Date(Date.UTC(+y, +mo - 1, +da, +hh, +mm, +ss));
-  const deltaMs = melbAsUtc.getTime() - inputAsUtc.getTime();
-
-  const correctedUtc = new Date(approxUtc.getTime() - deltaMs);
-  if (Number.isNaN(correctedUtc.getTime())) return null;
-  return correctedUtc.toISOString();
-}
-
 // Compare (utcIso, id) tuples
-function isAfterCursor(evUtcIso, evId, curUtcIso, curId) {
-  if (evUtcIso > curUtcIso) return true;
-  if (evUtcIso < curUtcIso) return false;
+function isAfterCursor(evIso, evId, curIso, curId) {
+  if (evIso > curIso) return true;
+  if (evIso < curIso) return false;
   return String(evId) > String(curId || "");
 }
 
@@ -163,58 +39,54 @@ async function main() {
 
   const state = stateSnap.data() || {};
 
-  // Worker cursor (strong): UTC + id
-  const lastUtcIso = state.last_event_date_utc || "1970-01-01T00:00:00.000Z";
-  const lastEventId = state.last_event_id || "";
+  // Worker cursor (strong): created_at ISO + doc id
+  const lastIso = state.last_event_date_utc || "1970-01-01T00:00:00.000Z";
+  const lastDocId = state.last_event_id || "";
 
-  console.log("⏱️ cursor utc:", lastUtcIso, "cursor id:", lastEventId);
+  console.log("⏱️ cursor:", lastIso, "id:", lastDocId);
 
-  // Paging cursor (for Firestore query ordering)
-  let pageAfterRaw = null;
+  // Paging cursor
+  let pageAfterCreatedAt = null;
   let pageAfterId = null;
 
   const PAGE_SIZE = 250;
   const MAX_TO_PROCESS = 10;
-  const MAX_PAGES = 200; // safety valve (250 * 200 = 50,000 docs max scan)
+  const MAX_PAGES = 200;
 
-  // Gather up to MAX_TO_PROCESS events after strong cursor
   const batch = [];
 
   for (let page = 0; page < MAX_PAGES && batch.length < MAX_TO_PROCESS; page++) {
     let q = db
-      .collection("events")
-      .where("event_type", "==", "launch")
-      .orderBy("event_date", "asc")
+      .collection("launches_v2")
+      .orderBy("created_at", "asc")
       .orderBy(FieldPath.documentId(), "asc")
       .limit(PAGE_SIZE);
 
-    if (pageAfterRaw && pageAfterId) {
-      q = q.startAfter(pageAfterRaw, pageAfterId);
+    if (pageAfterCreatedAt && pageAfterId) {
+      q = q.startAfter(pageAfterCreatedAt, pageAfterId);
     }
 
     const snap = await q.get();
     if (snap.empty) break;
 
-    // Update paging cursor to last doc in this page
     const lastDoc = snap.docs[snap.docs.length - 1];
-    pageAfterRaw = lastDoc.data().event_date || null;
+    pageAfterCreatedAt = lastDoc.data().created_at || null;
     pageAfterId = lastDoc.id;
 
     for (const doc of snap.docs) {
       if (batch.length >= MAX_TO_PROCESS) break;
 
-      const ev = doc.data();
-      const raw = ev.event_date;
-      const utcIso = melbourneLocalToUtcIsoZ(raw);
-      if (!raw || !utcIso) continue;
+      const launch = doc.data();
+      const createdAt = launch.created_at;
+      if (!createdAt) continue;
 
-      if (isAfterCursor(utcIso, doc.id, lastUtcIso, lastEventId)) {
-        batch.push({ doc, ev, raw, utcIso });
+      if (isAfterCursor(createdAt, doc.id, lastIso, lastDocId)) {
+        batch.push({ doc, launch, createdAt });
       }
     }
   }
 
-  console.log("🔎 new launch events found:", batch.length);
+  console.log("🔎 new launches found:", batch.length);
 
   if (batch.length === 0) {
     console.log("✅ nothing to do");
@@ -226,46 +98,66 @@ async function main() {
     process.env.LEDGER_ADDRESS
   );
 
-  let newestConfirmedUtcIso = lastUtcIso;
-  let newestConfirmedId = lastEventId;
+  const feeData = await hre.ethers.provider.getFeeData();
+  const overrides = {
+    maxFeePerGas: feeData.maxFeePerGas,
+    maxPriorityFeePerGas: feeData.maxPriorityFeePerGas,
+  };
+
+  let newestConfirmedIso = lastIso;
+  let newestConfirmedId = lastDocId;
 
   for (const item of batch) {
     const doc = item.doc;
-    const ev = item.ev;
-    const eventId = doc.id;
+    const launch = item.launch;
+    const launchId = doc.id;
+    const workspaceId = launch.workspace_id;
 
-    const platform = ev?.metadata?.platform || ev?.platform || null;
-    const projectId = ev?.metadata?.project_id || ev?.project_id || null;
+    // Only record if at least one platform succeeded
+    const platformsArr = Array.isArray(launch.platforms) ? launch.platforms : [];
+    const successfulPlatforms = [
+      ...new Set(
+        platformsArr
+          .filter((p) => p && p.status === "success")
+          .map((p) => p.platform)
+          .filter(Boolean)
+      ),
+    ].sort();
 
-    if (!platform || !projectId) {
-      console.log("⚠️ skipping event missing platform/project:", { eventId, platform, projectId });
+    if (successfulPlatforms.length === 0) {
+      console.log("⚠️ no successful platforms, skipping:", launchId);
       continue;
     }
 
-    const stageRef = db.collection("onchain_publish_events").doc(eventId);
+    if (!workspaceId) {
+      console.log("⚠️ missing workspace_id, skipping:", launchId);
+      continue;
+    }
+
+    const stageRef = db.collection("onchain_publish_events").doc(launchId);
     const stageSnap = await stageRef.get();
 
     if (stageSnap.exists && stageSnap.data().status === "confirmed") {
-      console.log("↩️ already confirmed, skipping:", eventId);
+      console.log("↩️ already confirmed, skipping:", launchId);
 
-      if (isAfterCursor(item.utcIso, eventId, newestConfirmedUtcIso, newestConfirmedId)) {
-        newestConfirmedUtcIso = item.utcIso;
-        newestConfirmedId = eventId;
+      if (isAfterCursor(item.createdAt, doc.id, newestConfirmedIso, newestConfirmedId)) {
+        newestConfirmedIso = item.createdAt;
+        newestConfirmedId = doc.id;
       }
       continue;
     }
 
     if (stageSnap.exists && stageSnap.data().status === "pending" && stageSnap.data().txHash) {
-      console.log("⏳ already pending, skipping:", eventId);
+      console.log("⏳ already pending, skipping:", launchId);
       continue;
     }
 
     const prev = stageSnap.exists ? stageSnap.data() : {};
     const attempts = Number(prev.attempts || 0);
 
-    // Dead-letter: permanently mark events that have exhausted retries
+    // Dead-letter: permanently mark launches that have exhausted retries
     if (attempts >= 5) {
-      console.log("🛑 dead-letter: max attempts reached:", eventId);
+      console.log("🛑 dead-letter: max attempts reached:", launchId);
       await stageRef.set(
         {
           status: "dead_letter",
@@ -278,15 +170,36 @@ async function main() {
       continue;
     }
 
-    // Resolve real owner profileId — refuse to write on-chain with a placeholder
-    const ownerProfileId = resolveOwnerProfileId(ev, prev);
+    // Resolve contributors from workspace/team
+    let contributors = [];
+    let ownerProfileId = null;
+
+    const workspaceSnap = await db.collection("workspaces_v2").doc(workspaceId).get();
+    const workspace = workspaceSnap.exists ? workspaceSnap.data() : {};
+
+    if (workspace.team_id) {
+      const teamSnap = await db.collection("teams_v2").doc(workspace.team_id).get();
+      const team = teamSnap.exists ? teamSnap.data() : {};
+
+      ownerProfileId = team.owner_id || launch.created_by || null;
+
+      const memberIds = Array.isArray(team.member_profile_ids) ? team.member_profile_ids : [];
+      contributors = [...new Set([team.owner_id, ...memberIds].filter(Boolean))];
+    } else {
+      ownerProfileId = launch.created_by || null;
+      contributors = launch.created_by ? [launch.created_by] : [];
+    }
+
+    // Remove nulls and dedupe (safety)
+    contributors = [...new Set(contributors.filter(Boolean))];
+
     if (!ownerProfileId) {
-      console.log("❌ no profileId found for event, marking failed:", eventId);
+      console.log("❌ no ownerProfileId for launch, marking failed:", launchId);
       await stageRef.set(
         {
-          source_event_id: eventId,
-          source_collection: "events",
-          source_event_type: "launch",
+          source_launch_id: launchId,
+          source_collection: "launches_v2",
+          workspace_id: workspaceId,
           status: "failed",
           last_error: "missing_profile_id",
           attempts: attempts + 1,
@@ -298,20 +211,33 @@ async function main() {
       continue;
     }
 
-    // Build and deduplicate contributor list — no placeholders allowed
-    const rawContributors = buildContributors(prev, ev, ownerProfileId);
-    const contributors = deduplicateContributors(rawContributors);
+    if (contributors.length === 0) {
+      console.log("❌ no contributors for launch, marking failed:", launchId);
+      await stageRef.set(
+        {
+          source_launch_id: launchId,
+          source_collection: "launches_v2",
+          workspace_id: workspaceId,
+          status: "failed",
+          last_error: "no_contributors",
+          attempts: attempts + 1,
+          updated_at: FieldValue.serverTimestamp(),
+          created_at: prev.created_at || FieldValue.serverTimestamp(),
+        },
+        { merge: true }
+      );
+      continue;
+    }
+
+    const contributorsJubjub = contributors.map((id) => ({ profileId: id, role: "member" }));
 
     await stageRef.set(
       {
-        source_event_id: eventId,
-        source_collection: "events",
-        source_event_type: "launch",
-        source_event_date_raw: item.raw,
-        source_event_date_utc: item.utcIso,
-        project_id: projectId,
-        platform: platform,
-        chain: "baseSepolia",
+        source_launch_id: launchId,
+        source_collection: "launches_v2",
+        workspace_id: workspaceId,
+        platforms: successfulPlatforms,
+        chain: process.env.CHAIN || "baseSepolia",
         ledger_address: process.env.LEDGER_ADDRESS,
         status: "staged",
         attempts: attempts,
@@ -319,29 +245,29 @@ async function main() {
         updated_at: FieldValue.serverTimestamp(),
         created_at: prev.created_at || FieldValue.serverTimestamp(),
         owner_profile_id: ownerProfileId,
-        contributors_jubjub: contributors,
+        contributors_jubjub_profile_ids: contributors,
+        contributors_jubjub: contributorsJubjub,
       },
       { merge: true }
     );
 
-    const projectIdB32 = b32(projectId);
-    const platformB32 = b32(platform);
-    const sourceEventIdB32 = b32(eventId);
-    const ownerProfileB32 = b32(ownerProfileId);
-
-    const contributorsB32 = contributors.map((c) => b32(c.profileId));
-    const rolesU8 = contributors.map((c) => roleToUint8(c.role));
-
     try {
-      console.log("⛓️ submitting onchain:", { eventId, platform, projectId, ownerProfileId });
+      console.log("⛓️ submitting onchain:", {
+        launchId,
+        workspaceId,
+        ownerProfileId,
+        platforms: successfulPlatforms,
+        contributors,
+      });
 
-      const tx = await ledger.recordPublish(
-        projectIdB32,
-        platformB32,
-        sourceEventIdB32,
-        ownerProfileB32,
-        contributorsB32,
-        rolesU8
+      const tx = await ledger.recordLaunch(
+        b32(workspaceId),
+        b32(launchId),
+        b32(ownerProfileId),
+        successfulPlatforms.map((p) => b32(p)),
+        contributors.map((id) => b32(id)),
+        contributors.map(() => 0),
+        overrides
       );
 
       await stageRef.set(
@@ -367,15 +293,15 @@ async function main() {
         { merge: true }
       );
 
-      console.log("✅ confirmed:", eventId, "block:", receipt.blockNumber);
+      console.log("✅ confirmed:", launchId, "block:", receipt.blockNumber);
 
-      if (isAfterCursor(item.utcIso, eventId, newestConfirmedUtcIso, newestConfirmedId)) {
-        newestConfirmedUtcIso = item.utcIso;
-        newestConfirmedId = eventId;
+      if (isAfterCursor(item.createdAt, doc.id, newestConfirmedIso, newestConfirmedId)) {
+        newestConfirmedIso = item.createdAt;
+        newestConfirmedId = doc.id;
       }
     } catch (err) {
       const msg = err && err.message ? err.message.slice(0, 400) : String(err);
-      console.log("❌ onchain submit failed:", eventId, msg);
+      console.log("❌ onchain submit failed:", launchId, msg);
 
       await stageRef.set(
         {
@@ -391,11 +317,11 @@ async function main() {
 
   // Persist worker cursor (strong)
   const workerCursorChanged =
-    newestConfirmedUtcIso !== lastUtcIso || String(newestConfirmedId) !== String(lastEventId);
+    newestConfirmedIso !== lastIso || String(newestConfirmedId) !== String(lastDocId);
 
   await stateRef.set(
     {
-      last_event_date_utc: newestConfirmedUtcIso,
+      last_event_date_utc: newestConfirmedIso,
       last_event_id: newestConfirmedId,
       last_run_at: FieldValue.serverTimestamp(),
     },
@@ -403,7 +329,7 @@ async function main() {
   );
 
   if (workerCursorChanged) {
-    console.log("➡️ cursor advanced to:", newestConfirmedUtcIso, "id:", newestConfirmedId);
+    console.log("➡️ cursor advanced to:", newestConfirmedIso, "id:", newestConfirmedId);
   } else {
     console.log("↪️ cursor unchanged");
   }

@@ -29,8 +29,20 @@ contract JubJubPublishLedger {
         uint256 timestamp
     );
 
+    event LaunchRecorded(
+        bytes32 indexed workspaceId,
+        bytes32 indexed launchId,
+        address indexed recorder,
+        bytes32 ownerProfile,
+        bytes32[] platforms,
+        bytes32[] contributors,
+        uint8[] roles,
+        uint256 timestamp
+    );
+
     error ContributorsRolesLengthMismatch();
     error EmptyContributors();
+    error EmptyPlatforms();
 
     function recordPublish(
         bytes32 mediaHash,
@@ -49,6 +61,30 @@ contract JubJubPublishLedger {
             platform,
             destination,
             publishId,
+            contributors,
+            roles,
+            block.timestamp
+        );
+    }
+
+    function recordLaunch(
+        bytes32 workspaceId,
+        bytes32 launchId,
+        bytes32 ownerProfile,
+        bytes32[] calldata platforms,
+        bytes32[] calldata contributors,
+        uint8[] calldata roles
+    ) external {
+        if (platforms.length == 0) revert EmptyPlatforms();
+        if (contributors.length == 0) revert EmptyContributors();
+        if (contributors.length != roles.length) revert ContributorsRolesLengthMismatch();
+
+        emit LaunchRecorded(
+            workspaceId,
+            launchId,
+            msg.sender,
+            ownerProfile,
+            platforms,
             contributors,
             roles,
             block.timestamp

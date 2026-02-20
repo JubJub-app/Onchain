@@ -6,7 +6,13 @@ async function main() {
   console.log("Balance:", balance.toString());
 
   const Ledger = await ethers.getContractFactory("JubJubPublishLedger");
-  const ledger = await Ledger.deploy();
+  const feeData = await deployer.provider.getFeeData();
+  const nonce = await deployer.getNonce();
+  const ledger = await Ledger.deploy({
+    nonce,
+    maxFeePerGas: feeData.maxFeePerGas,
+    maxPriorityFeePerGas: feeData.maxPriorityFeePerGas,
+  });
 
   await ledger.waitForDeployment();
 
