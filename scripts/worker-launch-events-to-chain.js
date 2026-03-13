@@ -28,6 +28,32 @@ function isAfterCursor(evIso, evId, curIso, curId) {
   return String(evId) > String(curId || "");
 }
 
+/**
+ * Extract proof-of-publish entries from a launch's platforms array.
+ *
+ * Uses the same success filter as the main worker loop (p.status === "success").
+ * Only includes entries where published_id is a non-empty trimmed string.
+ * Returns [] if nothing qualifies — never blocks launch processing.
+ *
+ * @param {Array} platformsArr - launch.platforms from Firestore
+ * @returns {Array<{platform: string, published_id: string}>}
+ */
+function extractPublishProofs(platformsArr) {
+  if (!Array.isArray(platformsArr)) return [];
+  return platformsArr
+    .filter(
+      (p) =>
+        p &&
+        p.status === "success" &&
+        typeof p.published_id === "string" &&
+        p.published_id.trim().length > 0
+    )
+    .map((p) => ({
+      platform: p.platform,
+      published_id: p.published_id.trim(),
+    }));
+}
+
 async function main() {
   const db = admin.firestore();
 
@@ -128,6 +154,8 @@ async function main() {
       console.log("⚠️ no successful platforms, skipping:", launchId);
       continue;
     }
+
+    const publishProofs = extractPublishProofs(platformsArr);
 
     if (!workspaceId) {
       console.log("⚠️ missing workspace_id, skipping:", launchId);
@@ -237,6 +265,7 @@ async function main() {
         source_collection: "launches_v2",
         workspace_id: workspaceId,
         platforms: successfulPlatforms,
+        publish_proofs: publishProofs,
         chain: process.env.CHAIN || "baseSepolia",
         ledger_address: process.env.LEDGER_ADDRESS,
         status: "staged",
@@ -244,6 +273,7 @@ async function main() {
         last_error: null,
         updated_at: FieldValue.serverTimestamp(),
         created_at: prev.created_at || FieldValue.serverTimestamp(),
+        source_event_date_utc: launch.completed_at || launch.created_at,
         owner_profile_id: ownerProfileId,
         contributors_jubjub_profile_ids: contributors,
         contributors_jubjub: contributorsJubjub,
