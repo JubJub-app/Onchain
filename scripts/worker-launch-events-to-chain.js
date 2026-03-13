@@ -51,6 +51,9 @@ function extractPublishProofs(platformsArr) {
     .map((p) => ({
       platform: p.platform,
       published_id: p.published_id.trim(),
+      ...(typeof p.published_url === "string" && p.published_url.trim().length > 0
+        ? { published_url: p.published_url.trim() }
+        : {}),
     }));
 }
 
@@ -259,12 +262,18 @@ async function main() {
 
     const contributorsJubjub = contributors.map((id) => ({ profileId: id, role: "member" }));
 
+    // First successful platform + its published_url for Vault frontend display
+    const firstProofWithUrl = publishProofs.find((p) => p.published_url);
+    const firstPlatform = successfulPlatforms[0] || null;
+
     await stageRef.set(
       {
         source_launch_id: launchId,
         source_collection: "launches_v2",
         workspace_id: workspaceId,
+        platform: firstPlatform,
         platforms: successfulPlatforms,
+        published_url: firstProofWithUrl ? firstProofWithUrl.published_url : null,
         publish_proofs: publishProofs,
         chain: process.env.CHAIN || "baseSepolia",
         ledger_address: process.env.LEDGER_ADDRESS,
